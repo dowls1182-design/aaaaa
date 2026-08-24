@@ -8,12 +8,11 @@ import Toast from "@/components/Toast";
 import TopBar from "@/components/TopBar";
 import TranslationPane from "@/components/TranslationPane";
 import {
-  DUMMY_ENGLISH_DRAFT,
-  DUMMY_EXTRACTED_BODY,
-  DUMMY_EXTRACTED_META,
-  DUMMY_JAPANESE_DRAFT,
-  DUMMY_KOREAN_DRAFT,
-} from "@/lib/dummyData";
+  EXTRACT_SYSTEM,
+  REPROCESS_SYSTEM,
+  TRANSLATE_EN_SYSTEM,
+  TRANSLATE_JA_SYSTEM,
+} from "@/lib/prompts";
 import {
   copyToClipboard,
   koreanDraftToText,
@@ -32,11 +31,20 @@ import {
  * ⚠️ 지금은 실제 크롤링·AI 연결 없이 더미(가짜) 데이터로 동작합니다.
  *    다음 단계에서 아래 `sleep(...)` 부분을 실제 API 호출로 바꾸면 됩니다.
  */
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+async function callGemini(system: string, prompt: string, useUrlContext = false) {
+  const response = await fetch("/api/gemini", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ system, prompt, useUrlContext }),
+  });
+  const data = (await response.json()) as { text?: string; error?: string };
+  if (!response.ok || !data.text) throw new Error(data.error ?? "AI 처리에 실패했습니다.");
+  return data.text;
+}
 
-/** 더미 데이터를 그대로 쓰면 수정 내용이 원본을 덮어쓰므로, 복사본을 만들어 씁니다. */
-function clone<T>(value: T): T {
-  return structuredClone(value);
+function parseJson<T>(text: string): T {
+  const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  return JSON.parse(cleaned) as T;
 }
 
 export default function Home() {
@@ -87,20 +95,22 @@ export default function Home() {
     }
 
     setIsImporting(true);
-    await sleep(700); // 👉 다음 단계에서 /api/extract 호출로 교체
-
-    setInput((prev) => ({
-      ...prev,
-      bodyText: DUMMY_EXTRACTED_BODY,
-      // 이미 직접 입력한 항목은 지우지 않고, 비어 있는 항목만 채웁니다.
-      outlet: prev.outlet || DUMMY_EXTRACTED_META.outlet,
-      reporter: prev.reporter || DUMMY_EXTRACTED_META.reporter,
-      originalTitle: prev.originalTitle || DUMMY_EXTRACTED_META.originalTitle,
-      publishedAt: prev.publishedAt || DUMMY_EXTRACTED_META.publishedAt,
-    }));
-
-    setIsImporting(false);
-    showToast("링크에서 본문을 불러왔습니다 — 아래 전문 칸을 확인하세요");
+    try {
+      const extracted = parseJson<ArticleInput>(await callGemini(EXTRACT_SYSTEM, input.url, true));
+      setInput((prev) => ({
+        ...prev,
+        bodyText: extracted.bodyText || prev.bodyText,
+        outlet: prev.outlet || extracted.outlet,
+        reporter: prev.reporter || extracted.reporter,
+        originalTitle: prev.originalTitle || extracted.originalTitle,
+        publishedAt: prev.publishedAt || extracted.publishedAt,
+      }));
+      showToast("링크에서 본문을 불러왔습니다 — 아래 전문 칸을 확인하세요");
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "기사 가져오기에 실패했습니다.");
+    } finally {
+      setIsImporting(false);
+    }
   };
 
   /* ---------------- ② 재가공 ---------------- */
@@ -111,17 +121,19 @@ export default function Home() {
     }
 
     setIsProcessing(true);
-    await sleep(1200); // 👉 다음 단계에서 /api/rewrite 호출로 교체
-
-    setKoDraft(clone(DUMMY_KOREAN_DRAFT));
-    // 새로 만들면 승인과 번역은 초기화합니다 (내용이 달라졌으므로)
-    setApproved(false);
-    setEnDraft(null);
-    setJaDraft(null);
-    setTab("ko");
-
-    setIsProcessing(false);
-    showToast("재가공 완료 — 결과를 검토하세요");
+    try {
+      const prompt = `언론사: ${input.outlet || "미입력"}\n기자명: ${input.reporter || "미입력"}\n기사 제목: ${input.originalTitle || "미입력"}\n게시일: ${input.publishedAt || "미입력"}\n기사 URL: ${input.url || "미입력"}\n\n기사 전문:\n${input.bodyText}`;
+      setKoDraft(parseJson<KoreanDraft>(await callGemini(REPROCESS_SYSTEM, prompt)));
+      setApproved(false);
+      setEnDraft(null);
+      setJaDraft(null);
+      setTab("ko");
+      showToast("재가공 완료 — 결과를 검토하세요");
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "재가공에 실패했습니다.");
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
   /* ---------------- 승인 토글 ---------------- */
@@ -137,14 +149,18 @@ export default function Home() {
   /* ---------------- ③ 번역 ---------------- */
   const handleTranslate = async (lang: "en" | "ja") => {
     setTranslatingLang(lang);
-    await sleep(1000); // 👉 다음 단계에서 /api/translate 호출로 교체
-
-    if (lang === "en") setEnDraft(clone(DUMMY_ENGLISH_DRAFT));
-    else setJaDraft(clone(DUMMY_JAPANESE_DRAFT));
-
-    setTranslatingLang(null);
-    setTab(lang);
-    showToast(lang === "en" ? "영어 번역 생성 완료" : "일본어 번역 생성 완료");
+    try {
+      const system = lang === "en" ? TRANSLATE_EN_SYSTEM : TRANSLATE_JA_SYSTEM;
+      const translated = parseJson<TranslatedDraft>(await callGemini(system, koreanDraftToText(koDraft!)));
+      if (lang === "en") setEnDraft(translated);
+      else setJaDraft(translated);
+      setTab(lang);
+      showToast(lang === "en" ? "영어 번역 생성 완료" : "일본어 번역 생성 완료");
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "번역에 실패했습니다.");
+    } finally {
+      setTranslatingLang(null);
+    }
   };
 
   /* ---------------- 복사 ---------------- */
